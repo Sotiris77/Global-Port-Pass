@@ -1,0 +1,629 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_DIR="global-port-pass"
+echo "==> Creating project at ./$APP_DIR"
+rm -rf "$APP_DIR"
+mkdir -p "$APP_DIR"
+cd "$APP_DIR"
+
+# -------- root files --------
+cat > .env.example <<'EOF'
+APP_NAME=Global Port Pass
+ENV=development
+SECRET_KEY=change-me-in-production
+ACCESS_TOKEN_EXPIRE_MINUTES=60
+
+POSTGRES_USER=gpp_user
+POSTGRES_PASSWORD=gpp_pass
+POSTGRES_DB=gpp_db
+POSTGRES_HOST=db
+POSTGRES_PORT=5432
+
+S3_ENDPOINT_URL=http://minio:9000
+S3_BUCKET=global-port-pass
+S3_REGION=us-east-1
+S3_ACCESS_KEY=minioadmin
+S3_SECRET_KEY=minioadmin
+S3_USE_SSL=false
+
+ADMIN_EMAIL=sotiriskaramanoglou@gmail.com
+EOF
+
+cat > docker-compose.yml <<'EOF'
+version: "3.9"
+services:
+  api:
+    build: ./backend
+    env_file: .env
+    depends_on: [db, minio, createbuckets]
+    ports: ["8000:8000"]
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-gpp_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gpp_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-gpp_db}
+    volumes: [ "db_data:/var/lib/postgresql/data" ]
+
+  minio:
+    image: minio/minio:RELEASE.2024-01-13T07-53-03Z
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-minioadmin}
+    command: server /data --console-address ":9001"
+    ports: ["9000:9000","9001:9001"]
+    volumes: [ "minio_data:/data" ]
+
+  createbuckets:
+    image: minio/mc
+    depends_on: [minio]
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${S3_ACCESS_KEY:-minioadmin} ${S3_SECRET_KEY:-minioadmin};
+      mc mb -p local/${S3_BUCKET:-global-port-pass} || true;
+      exit 0;
+      "
+
+volumes:
+  db_data:
+  minio_data:
+EOF
+
+cat > README.txt <<'EOF'
+GLOBAL PORT PASS — ONE-COMMAND LOCAL RUN
+
+1) Copy env and set a real SECRET_KEY:
+   cp .env.example .env
+   # then open .env and change SECRET_KEY to a long random string
+
+2) Start everything (API + DB + MinIO):
+   docker compose up --build
+
+3) Open:
+   API docs:  http://localhost:8000/docs
+   MinIO UI:  http://localhost:9001  (minioadmin / minioadmin)
+
+4) Flow:
+   - Register/Login
+   - Upload documents
+   - Create one-time passcodes
+   - Verify passcode to get one-time download URL
+EOF
+
+# -------- backend --------
+mkdir -p backend/app/{api,core,db,models,schemas,services} backend/alembic/versions
+
+cat > backend/requirements.txt <<'EOF'
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+python-multipart==0.0.9
+pydantic==2.7.1
+pydantic-settings==2.2.1
+SQLAlchemy==2.0.30
+alembic==1.13.2
+psycopg2-binary==2.9.9
+passlib[bcrypt]==1.7.4
+python-jose[cryptography]==3.3.0
+boto3==1.34.113
+EOF
+
+cat > backend/Dockerfile <<'EOF'
+FROM python:3.11-slim
+WORKDIR /app
+RUN apt-get update && apt-get install -y build-essential && rm -rf /var/lib/apt/lists/*
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+COPY app /app/app
+COPY alembic /app/alembic
+COPY alembic.ini /app/alembic.ini
+COPY start.sh /app/start.sh
+RUN chmod +x /app/start.sh
+EXPOSE 8000
+CMD ["/app/start.sh"]
+EOF
+
+cat > backend/start.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+echo "Running Alembic migrations..."
+alembic upgrade head
+echo "Starting API..."
+exec uvicorn app.main:app --host 0.0.0.0 --port 8000
+EOF
+chmod +x backend/start.sh
+
+cat > backend/alembic.ini <<'EOF'
+[alembic]
+script_location = alembic
+sqlalchemy.url = postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}
+[loggers]
+keys = root,sqlalchemy,alembic
+[handlers]
+keys = console
+[formatters]
+keys = generic
+[logger_root]
+level = WARN
+handlers = console
+[logger_sqlalchemy]
+level = WARN
+handlers =
+qualname = sqlalchemy.engine
+[logger_alembic]
+level = INFO
+handlers = console
+qualname = alembic
+[handler_console]
+class = StreamHandler
+args = (sys.stderr,)
+level = NOTSET
+formatter = generic
+[formatter_generic]
+format = %(asctime)s %(levelname)-5.5s [%(name)s] %(message)s
+EOF
+
+cat > backend/alembic/env.py <<'EOF'
+from __future__ import with_statement
+from logging.config import fileConfig
+from sqlalchemy import engine_from_config, pool
+from alembic import context
+import os, sys
+config = context.config
+fileConfig(config.config_file_name)
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from app.db.base import Base  # noqa
+from app.models.user import User  # noqa
+from app.models.document import Document  # noqa
+from app.models.passcode import AccessPasscode  # noqa
+from app.models.audit import AuditLog  # noqa
+target_metadata = Base.metadata
+def get_url():
+    user = os.getenv("POSTGRES_USER", "gpp_user")
+    password = os.getenv("POSTGRES_PASSWORD", "gpp_pass")
+    host = os.getenv("POSTGRES_HOST", "db")
+    port = os.getenv("POSTGRES_PORT", "5432")
+    db = os.getenv("POSTGRES_DB", "gpp_db")
+    return f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{db}"
+def run_migrations_offline():
+    url = get_url()
+    context.configure(url=url, target_metadata=target_metadata, literal_binds=True, compare_type=True)
+    with context.begin_transaction():
+        context.run_migrations()
+def run_migrations_online():
+    connectable = engine_from_config(
+        config.get_section(config.config_ini_section),
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+        url=get_url(),
+    )
+    with connectable.connect() as connection:
+        context.configure(connection=connection, target_metadata=target_metadata, compare_type=True)
+        with context.begin_transaction():
+            context.run_migrations()
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    run_migrations_online()
+EOF
+
+cat > backend/alembic/versions/0001_init.py <<'EOF'
+from alembic import op
+import sqlalchemy as sa
+revision = '0001_init'
+down_revision = None
+branch_labels = None
+depends_on = None
+def upgrade():
+    op.create_table('users',
+        sa.Column('id', sa.Integer(), nullable=False),
+        sa.Column('email', sa.String(length=255), nullable=False),
+        sa.Column('hashed_password', sa.String(length=255), nullable=False),
+        sa.Column('is_admin', sa.Boolean(), server_default=sa.text('false')),
+        sa.Column('role', sa.String(length=50), nullable=False, server_default='vessel'),
+        sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.func.now()),
+        sa.PrimaryKeyConstraint('id')
+    )
+    op.create_index(op.f('ix_users_email'), 'users', ['email'], unique=True)
+    op.create_index(op.f('ix_users_id'), 'users', ['id'], unique=False)
+    op.create_table('documents',
+        sa.Column('id', sa.Integer(), nullable=False),
+        sa.Column('owner_id', sa.Integer(), nullable=False),
+        sa.Column('filename', sa.String(length=255), nullable=False),
+        sa.Column('content_type', sa.String(length=100), nullable=False),
+        sa.Column('s3_key', sa.String(length=512), nullable=False),
+        sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.func.now()),
+        sa.ForeignKeyConstraint(['owner_id'], ['users.id']),
+        sa.PrimaryKeyConstraint('id')
+    )
+    op.create_index(op.f('ix_documents_id'), 'documents', ['id'], unique=False)
+    op.create_index(op.f('ix_documents_s3_key'), 'documents', ['s3_key'], unique=True)
+    op.create_table('access_passcodes',
+        sa.Column('id', sa.Integer(), nullable=False),
+        sa.Column('document_id', sa.Integer(), nullable=False),
+        sa.Column('code', sa.String(length=12), nullable=False),
+        sa.Column('expires_at', sa.DateTime(timezone=True), nullable=False),
+        sa.Column('used', sa.Boolean(), server_default=sa.text('false')),
+        sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.func.now()),
+        sa.ForeignKeyConstraint(['document_id'], ['documents.id']),
+        sa.PrimaryKeyConstraint('id')
+    )
+    op.create_index(op.f('ix_access_passcodes_document_id'), 'access_passcodes', ['document_id'], unique=False)
+    op.create_index(op.f('ix_access_passcodes_code'), 'access_passcodes', ['code'], unique=False)
+    op.create_table('audit_logs',
+        sa.Column('id', sa.Integer(), nullable=False),
+        sa.Column('actor_id', sa.Integer(), nullable=True),
+        sa.Column('action', sa.String(length=100), nullable=False),
+        sa.Column('entity_type', sa.String(length=50), nullable=False),
+        sa.Column('entity_id', sa.Integer(), nullable=True),
+        sa.Column('meta', sa.JSON(), nullable=True),
+        sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.func.now()),
+        sa.ForeignKeyConstraint(['actor_id'], ['users.id']),
+        sa.PrimaryKeyConstraint('id')
+    )
+def downgrade():
+    op.drop_table('audit_logs')
+    op.drop_index(op.f('ix_access_passcodes_code'), table_name='access_passcodes')
+    op.drop_index(op.f('ix_access_passcodes_document_id'), table_name='access_passcodes')
+    op.drop_table('access_passcodes')
+    op.drop_index(op.f('ix_documents_s3_key'), table_name='documents')
+    op.drop_index(op.f('ix_documents_id'), table_name='documents')
+    op.drop_table('documents')
+    op.drop_index(op.f('ix_users_id'), table_name='users')
+    op.drop_index(op.f('ix_users_email'), table_name='users')
+    op.drop_table('users')
+EOF
+
+# backend app code
+cat > backend/app/__init__.py <<'EOF'
+# package marker
+EOF
+
+cat > backend/app/core/config.py <<'EOF'
+from pydantic_settings import BaseSettings, SettingsConfigDict
+class Settings(BaseSettings):
+    app_name: str = "Global Port Pass"
+    env: str = "development"
+    secret_key: str
+    access_token_expire_minutes: int = 60
+    postgres_user: str
+    postgres_password: str
+    postgres_db: str
+    postgres_host: str = "db"
+    postgres_port: int = 5432
+    s3_endpoint_url: str
+    s3_bucket: str
+    s3_region: str = "us-east-1"
+    s3_access_key: str
+    s3_secret_key: str
+    s3_use_ssl: bool = False
+    admin_email: str
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    @property
+    def database_url(self) -> str:
+        return f"postgresql+psycopg2://{self.postgres_user}:{self.postgres_password}@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
+settings = Settings()
+EOF
+
+cat > backend/app/db/base.py <<'EOF'
+from sqlalchemy.orm import DeclarativeBase
+class Base(DeclarativeBase):
+    pass
+EOF
+
+cat > backend/app/db/session.py <<'EOF'
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from app.core.config import settings
+engine = create_engine(settings.database_url, pool_pre_ping=True)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+EOF
+
+mkdir -p backend/app/api
+cat > backend/app/api/__init__.py <<'EOF'
+# package marker
+EOF
+
+cat > backend/app/api/deps.py <<'EOF'
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from jose import jwt, JWTError
+from sqlalchemy.orm import Session
+from app.db.session import SessionLocal
+from app.core.config import settings
+from app.models.user import User
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, settings.secret_key, algorithms=["HS256"])
+        email: str = payload.get("sub")
+        if email is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        raise credentials_exception
+    return user
+EOF
+
+cat > backend/app/api/rbac.py <<'EOF'
+from fastapi import Depends, HTTPException, status
+from app.api.deps import get_current_user
+def require_role(*allowed_roles: str):
+    def _deps(user = Depends(get_current_user)):
+        if user.role not in allowed_roles and not user.is_admin:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+        return user
+    return _deps
+EOF
+
+cat > backend/app/api/auth.py <<'EOF'
+from fastapi import APIRouter, Depends, HTTPException, status, Form
+from sqlalchemy.orm import Session
+from app.api.deps import get_db
+from app.models.user import User
+from app.schemas.user import UserCreate, UserOut
+from app.schemas.auth import Token
+from app.services.security import hash_password, verify_password, create_access_token
+from app.core.config import settings
+router = APIRouter(prefix="/auth", tags=["auth"])
+@router.post("/register", response_model=UserOut)
+def register(user_in: UserCreate, db: Session = Depends(get_db)):
+    existing = db.query(User).filter(User.email == user_in.email).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    is_admin = True if user_in.email == settings.admin_email else False
+    user = User(email=user_in.email, hashed_password=hash_password(user_in.password), role=user_in.role, is_admin=is_admin)
+    db.add(user); db.commit(); db.refresh(user)
+    return user
+@router.post("/login", response_model=Token)
+def login(username: str = Form(...), password: str = Form(...), db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == username).first()
+    if not user or not verify_password(password, user.hashed_password):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect username or password")
+    token = create_access_token(subject=user.email)
+    return Token(access_token=token)
+EOF
+
+cat > backend/app/api/documents.py <<'EOF'
+import io, uuid
+from datetime import datetime, timedelta
+from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
+from sqlalchemy.orm import Session
+from app.api.deps import get_db, get_current_user
+from app.api.rbac import require_role
+from app.models.document import Document
+from app.models.passcode import AccessPasscode
+from app.schemas.document import DocumentOut, PasscodeCreate, PasscodeVerify
+from app.services.storage import upload_fileobj, generate_presigned_url
+from app.services.audit import log_audit
+router = APIRouter(prefix="/documents", tags=["documents"])
+@router.get("/", response_model=list[DocumentOut])
+def list_my_documents(db: Session = Depends(get_db), user=Depends(get_current_user)):
+    return db.query(Document).filter(Document.owner_id == user.id).order_by(Document.id.desc()).all()
+@router.post("/upload", response_model=DocumentOut)
+def upload_document(file: UploadFile = File(...), db: Session = Depends(get_db), user=Depends(require_role("vessel", "port", "admin"))):
+    key = f"{user.id}/{uuid.uuid4()}-{file.filename}"
+    data = io.BytesIO(file.file.read())
+    upload_fileobj(data, key, file.content_type or "application/octet-stream")
+    doc = Document(owner_id=user.id, filename=file.filename, content_type=file.content_type or "application/octet-stream", s3_key=key)
+    db.add(doc); db.commit(); db.refresh(doc)
+    log_audit(db, actor_id=user.id, action="upload_document", entity_type="document", entity_id=doc.id, meta={"filename": file.filename})
+    return doc
+@router.post("/{doc_id}/passcode", response_model=dict)
+def create_passcode(doc_id: int, payload: PasscodeCreate, db: Session = Depends(get_db), user=Depends(get_current_user)):
+    doc = db.query(Document).filter(Document.id == doc_id, Document.owner_id == user.id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    code = str(uuid.uuid4())[:6].upper()
+    expires_at = datetime.utcnow() + timedelta(minutes=payload.expires_minutes)
+    db.add(AccessPasscode(document_id=doc.id, code=code, expires_at=expires_at)); db.commit()
+    log_audit(db, actor_id=user.id, action="create_passcode", entity_type="document", entity_id=doc.id, meta={"expires_minutes": payload.expires_minutes})
+    return {"code": code, "expires_at": expires_at.isoformat() + "Z"}
+@router.post("/{doc_id}/passcode/verify", response_model=dict)
+def verify_passcode(doc_id: int, payload: PasscodeVerify, db: Session = Depends(get_db)):
+    record = db.query(AccessPasscode).filter(
+        AccessPasscode.document_id == doc_id,
+        AccessPasscode.code == payload.code,
+        AccessPasscode.used == False
+    ).first()
+    if not record:
+        raise HTTPException(status_code=400, detail="Invalid code")
+    if record.expires_at < datetime.utcnow():
+        raise HTTPException(status_code=400, detail="Code expired")
+    record.used = True; db.commit()
+    row = db.execute("SELECT s3_key, id FROM documents WHERE id = :id", {"id": doc_id}).first()
+    url = generate_presigned_url(row[0], expires_in=300)
+    log_audit(db, actor_id=None, action="verify_passcode", entity_type="document", entity_id=row[1], meta={"method": "one_time_url"})
+    return {"download_url": url, "expires_in_seconds": 300}
+EOF
+
+cat > backend/app/models/user.py <<'EOF'
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, func
+from app.db.base import Base
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String(255), unique=True, index=True, nullable=False)
+    hashed_password = Column(String(255), nullable=False)
+    is_admin = Column(Boolean, default=False)
+    role = Column(String(50), nullable=False, default="vessel")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+EOF
+
+cat > backend/app/models/document.py <<'EOF'
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, func
+from app.db.base import Base
+class Document(Base):
+    __tablename__ = "documents"
+    id = Column(Integer, primary_key=True)
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    filename = Column(String(255), nullable=False)
+    content_type = Column(String(100), nullable=False)
+    s3_key = Column(String(512), unique=True, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+EOF
+
+cat > backend/app/models/passcode.py <<'EOF'
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, func, Boolean
+from app.db.base import Base
+class AccessPasscode(Base):
+    __tablename__ = "access_passcodes"
+    id = Column(Integer, primary_key=True)
+    document_id = Column(Integer, ForeignKey("documents.id"), nullable=False, index=True)
+    code = Column(String(12), nullable=False, index=True)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    used = Column(Boolean, default=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+EOF
+
+cat > backend/app/models/audit.py <<'EOF'
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, func, JSON
+from app.db.base import Base
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+    id = Column(Integer, primary_key=True)
+    actor_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    action = Column(String(100), nullable=False)
+    entity_type = Column(String(50), nullable=False)
+    entity_id = Column(Integer, nullable=True)
+    meta = Column(JSON, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+EOF
+
+cat > backend/app/schemas/user.py <<'EOF'
+from pydantic import BaseModel, EmailStr
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str
+    role: str
+class UserOut(BaseModel):
+    id: int
+    email: EmailStr
+    role: str
+    is_admin: bool
+    class Config:
+        from_attributes = True
+EOF
+
+cat > backend/app/schemas/auth.py <<'EOF'
+from pydantic import BaseModel
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+EOF
+
+cat > backend/app/schemas/document.py <<'EOF'
+from pydantic import BaseModel
+class DocumentOut(BaseModel):
+    id: int
+    filename: str
+    content_type: str
+    s3_key: str
+    class Config:
+        from_attributes = True
+class PasscodeCreate(BaseModel):
+    expires_minutes: int = 10
+class PasscodeVerify(BaseModel):
+    code: str
+EOF
+
+cat > backend/app/services/security.py <<'EOF'
+from datetime import datetime, timedelta
+from typing import Optional
+from jose import jwt
+from passlib.context import CryptContext
+from app.core.config import settings
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+ALGORITHM = "HS256"
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+def verify_password(password: str, hashed: str) -> bool:
+    return pwd_context.verify(password, hashed)
+def create_access_token(subject: str, expires_minutes: Optional[int] = None) -> str:
+    expire = datetime.utcnow() + timedelta(minutes=expires_minutes or settings.access_token_expire_minutes)
+    payload = {"sub": subject, "exp": expire}
+    return jwt.encode(payload, settings.secret_key, algorithm=ALGORITHM)
+EOF
+
+cat > backend/app/services/storage.py <<'EOF'
+import boto3
+from botocore.client import Config
+from app.core.config import settings
+def get_s3_client():
+    return boto3.client(
+        "s3",
+        endpoint_url=settings.s3_endpoint_url,
+        aws_access_key_id=settings.s3_access_key,
+        aws_secret_access_key=settings.s3_secret_key,
+        region_name=settings.s3_region,
+        config=Config(signature_version="s3v4"),
+    )
+def upload_fileobj(fileobj, key: str, content_type: str):
+    s3 = get_s3_client()
+    s3.upload_fileobj(fileobj, settings.s3_bucket, key, ExtraArgs={"ContentType": content_type})
+def generate_presigned_url(key: str, expires_in: int = 600) -> str:
+    s3 = get_s3_client()
+    return s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": settings.s3_bucket, "Key": key},
+        ExpiresIn=expires_in
+    )
+EOF
+
+cat > backend/app/services/audit.py <<'EOF'
+from sqlalchemy.orm import Session
+from app.models.audit import AuditLog
+def log_audit(db: Session, *, actor_id: int | None, action: str, entity_type: str, entity_id: int | None, meta: dict | None = None):
+    db.add(AuditLog(actor_id=actor_id, action=action, entity_type=entity_type, entity_id=entity_id, meta=meta or {}))
+    db.commit()
+EOF
+
+cat > backend/app/main.py <<'EOF'
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from app.core.config import settings
+from app.api import auth, documents
+app = FastAPI(title=settings.app_name)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:8080","http://localhost:5173"],
+    allow_methods=["*"], allow_headers=["*"], allow_credentials=True
+)
+app.include_router(auth.router)
+app.include_router(documents.router)
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+EOF
+
+echo "==> Creating .env from example and setting a random SECRET_KEY"
+cp .env.example .env
+# Generate a quick random secret if possible
+if command -v openssl >/dev/null 2>&1; then
+  SECRET=$(openssl rand -hex 32)
+else
+  SECRET="dev-$(date +%s)-$RANDOM"
+fi
+# Replace only the default value
+sed -i.bak "s|SECRET_KEY=change-me-in-production|SECRET_KEY=${SECRET}|" .env || true
+rm -f .env.bak
+
+echo "==> Done. Start the stack with:"
+echo "    docker compose up --build"
+echo
+echo "Open API docs:  http://localhost:8000/docs"
+echo "MinIO console:  http://localhost:9001 (minioadmin/minioadmin)"
