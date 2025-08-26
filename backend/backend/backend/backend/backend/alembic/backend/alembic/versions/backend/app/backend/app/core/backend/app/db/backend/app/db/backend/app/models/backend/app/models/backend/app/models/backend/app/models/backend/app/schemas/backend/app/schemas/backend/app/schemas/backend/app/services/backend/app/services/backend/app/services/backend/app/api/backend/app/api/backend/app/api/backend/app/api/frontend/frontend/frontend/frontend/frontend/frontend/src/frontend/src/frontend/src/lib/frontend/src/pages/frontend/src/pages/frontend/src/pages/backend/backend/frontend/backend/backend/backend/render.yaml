@@ -1,0 +1,47 @@
+services:
+  - type: web
+    name: global-port-pass-api
+    env: docker
+    plan: starter
+    region: frankfurt
+    dockerfilePath: backend/Dockerfile
+    envVars:
+      - key: ENV
+        value: production
+      - key: SECRET_KEY
+        sync: false
+      - key: ACCESS_TOKEN_EXPIRE_MINUTES
+        value: 60
+      # Postgres from the Render database
+      - key: POSTGRES_USER
+        fromDatabase: { name: gpp-db, property: user }
+      - key: POSTGRES_PASSWORD
+        fromDatabase: { name: gpp-db, property: password }
+      - key: POSTGRES_DB
+        fromDatabase: { name: gpp-db, property: database }
+      - key: POSTGRES_HOST
+        fromDatabase: { name: gpp-db, property: host }
+      - key: POSTGRES_PORT
+        fromDatabase: { name: gpp-db, property: port }
+      # Cloudflare R2 (S3-compatible)
+      - key: S3_ENDPOINT_URL
+        value: https://b11ed2b95bb80f4496bf3f5fc6006128.r2.cloudflarestorage.com
+      - key: S3_BUCKET
+        value: global-port-pass
+      - key: S3_REGION
+        value: auto
+      - key: S3_ACCESS_KEY
+        sync: false
+      - key: S3_SECRET_KEY
+        sync: false
+      - key: S3_USE_SSL
+        value: true
+      - key: ADMIN_EMAIL
+        value: sotiriskaramanoglou@gmail.com
+    healthCheckPath: /health
+    autoDeploy: true
+
+databases:
+  - name: gpp-db
+    plan: starter
+    region: frankfurt
